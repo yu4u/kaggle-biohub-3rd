@@ -1,0 +1,26 @@
+services:
+  solution:
+    build: .
+    image: biohub046:latest
+    # all visible GPUs; restrict with CUDA_VISIBLE_DEVICES=0 (see README)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    shm_size: 32gb
+    # run as the host user so artifacts / cache are not root-owned: DOCKER_UID=$(id -u) DOCKER_GID=$(id -g)
+    user: "${DOCKER_UID:-0}:${DOCKER_GID:-0}"
+    environment:
+      - CUDA_VISIBLE_DEVICES
+      - BIOHUB_LIMIT
+      - BIOHUB_SMOKE
+      - BIOHUB_JOBS
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - HOME=/work/cache/home
+    volumes:
+      - ${INPUT_DIR:-./input}:/work/input:ro
+      - ${ARTIFACTS_DIR:-./artifacts}:/work/artifacts
+      - ${CACHE_DIR:-./cache}:/work/cache

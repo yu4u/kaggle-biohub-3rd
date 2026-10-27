@@ -1,0 +1,91 @@
+seed: 42
+name: div3f_smoke
+data:
+  target: parent  # parent / pre / post; independent single-output models
+  frame_offset: 0  # input-window center relative to the labeled node; pre +1 sees s,s+1,s+2
+  train_dir: input/train
+  fold_num: 5
+  fold_id: 0
+  downsample: [1, 4, 4]
+  champion_det_dir: output/champion_dets/dl_079_oof_last
+  drop_anomaly_links: true
+  anomaly_links_path: data/gt_anomaly_links.csv
+  gt_fill: true
+  reviewed_negative_path: null  # confirmed temporal negatives, training only
+  reviewed_negative_oversample: 0.0  # probability taken from uniform frame draws
+  pseudo_parent_path: null  # reviewed positives; training only, crop-component val exclusion
+  pseudo_to_gt_sampling: false  # positive-frame draws: pseudo 100% at epoch 1 -> GT 100% at last epoch
+  pseudo_to_gt_epochs: null  # null: total epochs; otherwise finish the transition earlier
+  div_oversample: 0.5
+  hard_neg_oversample: 0.0   # >0: with this probability draw a hard-negative frame — the daughters' birth
+                             # frame t+1 or the mother's frame t-1 of a parent frame, uniformly over both
+                             # (div_351). Applied after div_oversample: P(parent) = div_oversample,
+                             # P(hard neg) = hard_neg_oversample, rest uniform
+  items_per_epoch: 512
+  num_workers: 4
+  gain_aug: 0.5
+  d4_aug: true
+  zflip_aug: false
+  cube_aug: false
+  optics_aug: 0.0
+  floor_aug: 1.0
+  gt_swap_p: 0.0
+  gt_swap_jitter_um: 0.0
+  rot_scale_aug: 0.0
+  rot_aug: false
+  crop_yx: 0
+  pad_jitter_zyx: [0, 0, 0]
+  det_heatmap_train_dir: null
+  det_heatmap_val_dir: null
+  warp_flow_dir: null
+  warp_keep_raw: false
+  pos_frac: 1.0
+model:
+  arch: "3d"
+  base_channels: 32
+  segres_init_filters: 32
+  segres_blocks_down: [1, 1, 1, 1]
+  segres_blocks_up: [1, 1, 1]
+  segres_fusion: early
+  grad_ckpt: false
+  segres_init_ckpt: null
+  segres_fuse_init: random
+  z_conv: false
+  n_frames: 3
+  drop_path_rate: 0.0
+  freeze_encoder: false
+  decoder_dropout: 0.0
+  decoder_norm: bn
+  encoder_name: tf_efficientnetv2_s.in21k_ft_in1k
+  encoder_img_size: null
+  encoder_grad_ckpt: false
+  encoder_init_ckpt: null
+  stem_init: timm
+  out_tap: -1
+loss:
+  teacher_class_balanced: false  # equal means for teacher p>=.5 and p<.5
+  teacher_weight: 0.0  # KL from the frozen warm-start model over all training points
+  pseudo_pos_weight: 0.0  # separate mean BCE on reviewed pseudo parents
+  pseudo_as_gt: false    # merge reviewed positives into the GT-positive mean BCE
+  neg_weight: 1.0
+  det_neg_weight: 0.25
+  label_smoothing: 0.0
+train:
+  init_checkpoint: null # Optional full-model weights; {fold} expands to fold_id. Optimizer resets.
+  epochs: 200
+  batch_size: 8
+  lr: 2.5e-4
+  weight_decay: 0.0
+  encoder_lr_mult: 1.0
+  ema_decay: 0.0
+  freeze_encoder_epochs: 0
+  save_every_eval: false
+  warmup_epochs: 3
+  sched_epochs: null
+  min_lr: 1.0e-6
+  precision: bf16
+  output_dir: output/${name}
+eval:
+  batch_size: 8
+  neg_frame_stride: 4
+  every_n_epochs: 2

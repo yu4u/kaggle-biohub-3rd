@@ -1,0 +1,518 @@
+task:
+  seed: 42
+  save_top_k: 1
+  ckpt_monitor: val_edge   # metric for the top-k checkpoint callback; embed_only
+                           # runs use val_emb_acc (detection val is meaningless there)
+
+model:
+  arch: unet25d         # unet25d (default 2.5D timm UNet) | flowdet3d
+                        # (dl_243: FlowNet3D per-frame encoder + mirrored
+                        # single-stream decoder)
+                        # | unet25d_coarse ([1,4,4]-grid center cls + offset
+                        # regression on the stride-4 decoder feature; forces
+                        # iso_z. Output (B,4,Z,Y/4,X/4) = [cls_logit,dz,dy,dx].
+                        # det_threshold is a sigmoid PROBABILITY;
+                        # nms_kernel [3,3,3] (coarse-grid cells) is REQUIRED
+                        # (asserted at train time). decoder_channels is used
+                        # only up to the stride-4 stage (first encoder_depth-2
+                        # entries; the tail is ignored). Only
+                        # 21_test / eval_det_tradeoff / detect_sample
+                        # importers understand these ckpts — the ch0-heatmap
+                        # tools (eval_det_budget/oof/ensemble, diag_*) do NOT)
+  segres_init_filters: 32
+  segres_blocks_down: [1, 1, 1, 1]
+  segres_blocks_up: [1, 1, 1]
+  segres_norm: group
+  segres_init_ckpt: null
+  flow_base_channels: 32  # flowdet3d width c (enc widths c/2c/4c)
+  flow_backbone_ckpt: null  # flow ckpt whose enc0/1/2 init the encoder
+  flow_norm_groups: 0     # dl_250: >0 puts GroupNorm(g, C) after every conv
+                          # (0 = the norm-free blocks shared with ssl_flow)
+  # 2.5D UNet (core/unet, from kaggle-vesuvius): timm 2D encoder applied per z-slice
+  # + avg-pool depth downsampling + 3D conv decoder. Input (B,1,Z,Y,X) -> heatmap (B,1,Z,Y,X).
+  encoder_name: "tf_efficientnetv2_s.in21k_ft_in1k"  # dl_005/dl_011: best backbone so far
+  encoder_grad_ckpt: false  # dl_492: checkpoint every encoder block in training (unet25d
+                            # EfficientNet path; dl_493 adds the generic timm path, one
+                            # checkpoint per stem/stage). Same numbers, ~30% slower; lets
+                            # tf_efficientnet_b7 keep bs8 on a 32 GB GPU and caformer_m36
+                            # bs8 on a 24 GB 3090 (OOM without it)
+  encoder_img_size: null           # dl_543: fixed 2D size for timm encoders with size-bound attention
+                                    # (coatnet_rmlp / maxvit); yx of every input must equal it
+  encoder_drop_path_rate: null     # dl_805: stochastic depth for the timm encoder (timm drop_path_rate); null = timm default
+                        # (resnet18 0.831 / effnetv2_s 0.866 / convnext_small@1e-4 0.864 /
+                        #  caformer_s18@1e-4 0.864 on fold0 val)
+  pretrained: true
+  encoder_depth: 5
+  decoder_channels: [256, 128, 64, 32, 16]
+  in_channels: 1        # channels per frame (pair model keeps this at 1).
+                        # >1 = sliding z-slice window: the frozen SlidingSlicer
+                        # (identity Conv3d, timm_3d_encoder) stacks that many
+                        # ADJACENT z-slices as 2D channels per slice position,
+                        # and the timm stem is built at in_chans=N (3 = native
+                        # pretrained RGB stem). Verified 2026-08-28: shift/edge
+                        # semantics, fwd/bwd, speed parity (43ms vs 44ms),
+                        # +432 params. Dataset unchanged (input stays (B,1,Z,Y,X))
+  slicer_trainable: false   # dl_413 (siamese only): unfreeze the SlidingSlicer
+                            # Conv3d(1,N,(N,1,1)) (identity init kept, N*N weights
+                            # learn with the trunk). false = frozen identity
+                            # (every run up to dl_401)
+  embed_dim: 32         # siamese only: embedding channels (1x1x1 conv head off the
+                        # stride-2 decoder stage, L2-normalized in the loss)
+  embed_head_arch: linear   # linear = single 1x1x1 conv | conv3 = 3x3x3 x2 + 1x1x1
+                            # (deeper head for freeze_trunk: detection-trained
+                            # features need mixing capacity)
+  embed_tap: -2         # decoder block index feeding the embedding head:
+                        # -2 = stride-2 stage (default), -1 = finest stride-1
+                        # stage (for downsample [1,4,4] iso runs: sample the
+                        # 1.625 µm iso map instead of a stride-2 grid)
+  matcher: none         # none | xattn | xattn_cos: node-level cross-attention
+                        # matcher (core/matcher.py) trained END-TO-END with the
+                        # embedding trunk; replaces cosine logits with relational
+                        # pair scores + per-anchor null heads (embed_only runs).
+                        # xattn_cos = cosine prior + zero-init MLP residual
+                        # (starts at the descriptor baseline; xattn-from-random
+                        # trained unstably at lr 1e-3, dl_063)
+  matcher_drift_dpos: false   # pair-MLP geometry input = drift-compensated
+                              # residual (median-NN-displacement per boundary;
+                              # GT-free, same at train/inference)
+  matcher_dpos_noise_um: 0.0  # train-time Gaussian noise (µm) on the geometry
+                              # input (weakens the proximity shortcut)
+  matcher_attn_window_um: 0.0 # >0: self/cross attention restricted to pairs
+                              # within this µm distance.
+                              # 0 = all-to-all over the supplied nodes.
+                              # dl_369 trains on the full 64^3 downsampled frame;
+                              # its crop_size is also 64^3. Training candidate
+                              # caps and GT fill can still change the node set.
+                              # Isolated cross rows fall back to full attention
+  matcher_cls_head: false     # siamese matcher only: shared 3-way per-node
+                              # head (other / daughter at birth frame /
+                              # division parent) off the final cross-attended
+                              # features, supervised in both frame contexts;
+                              # trained via loss.matcher_cls_weight
+  matcher_role_embed: false   # siamese matcher only: learned frame-role
+                              # embeddings added to the projected tokens
+                              # (a = earlier frame, b = later). The encoder is
+                              # otherwise frame-symmetric and cannot sign time
+                              # direction — divisions collapse onto merge-like
+                              # patterns inside the trunk; a head-only fix
+                              # cannot recover it (dl_199/dl_200). Zero-init
+                              # (starts at the symmetric model)
+  matcher_d: 128        # siamese matcher only: NodeMatcher token width (proj /
+                        # attention / FFN / pair-MLP). 128 for every matcher up
+                        # to dl_369; dl_397 = 256 on the dl_369 recipe
+  flow_ckpt: null       # ssl_flow checkpoint: when set, the matcher's candidate
+                        # frame becomes the dense per-node flow instead of the
+                        # per-boundary collective drift (needs matcher_drift_frame)
+  matcher_drift_frame: true   # siamese matcher only: estimate collective drift
+                              # from detector candidates (no GT), move frame-t
+                              # nodes into t+1 coordinates, and use that SAME
+                              # frame for PE, candidate gating, dpos, far-positive
+                              # targets, and inference. Supersedes the narrower
+                              # matcher_drift_dpos probe when true. Default ON
+                              # (physically correct frame; dl_075): ignored with
+                              # matcher=none, and checkpoints predating the key
+                              # are pinned to false at cfg-restore (raw-frame
+                              # training must not be evaluated drift-frame)
+  freeze_trunk: false   # siamese only: load resume_path into the trunk
+                        # (non-strict), freeze everything but the embedding head
+                        # (BN stats frozen too), skip the detection loss. Use
+                        # loss.embed_warmup=[0,0] — detection is real from step 0
+  temporal: none        # none | pair | siamese. siamese = frames (t, t+1) encoded
+                        # INDEPENDENTLY with shared weights (batch-folded); heads:
+                        # heatmap (both frames supervised) + embedding for learned
+                        # linking (InfoNCE + null class, core/embed_loss.py).
+                        # pair = frames (t, t+1) through the SHARED 2.5D
+                        # encoder (batch-folded); each DECODER block of the frame-t
+                        # stream (upsample -> concat skip_t -> convs) then
+                        # cross-attends to the frame-t+1 ENCODER feature of the
+                        # same resolution at the selected stages (zero-init
+                        # residual = starts as a single-frame detector). 4ch head
+                        # [hm_t, flow dz, dy, dx] = frame-t predictions only.
+                        # Flow = GT-link displacement in output-grid voxels /
+                        # flow_scale_vox, supervised on the <=1.5 sigma core with
+                        # the Gaussian value as weight. Detection reads channel 0.
+  xattn_stages: [3, 2]  # encoder-stage RESOLUTIONS at which decoder cross-attention
+                        # runs (output strides 16 / 8). stage 4 = bottleneck has no
+                        # decoder block. stage 1 (stride 4, 1.6 µm grid -- first level
+                        # where 1-4 µm displacements are super-voxel) is affordable:
+                        # 65k tokens via SDPA, +0.2 GiB train / +0.08 s/frame infer.
+                        # stage 0 (stride 2, 524k tokens) is ~64x attention compute
+                        # and impractical.
+  iso_z_zmix: true      # iso_z only: false = drop the zero-init (3,1,1) ZMix convs and
+                        # change the pool schedule alone (z slices stay independent
+                        # until the first joint pool)
+  iso_z: false          # encoder keeps full z until the YX grid reaches 1/4 (where the
+                        # grid turns isotropic; input z is 4x coarser), pooling z with YX
+                        # only from there; zero-init residual (3,1,1) z-convs mix z at the
+                        # unpooled stages. Decoder adapts automatically (shape-driven).
+                        # NOTE: ~2-4x encoder activation memory/FLOPs (full z at the two
+                        # finest stages) -- may need smaller batch_size / frames_per_batch
+  # heatmap target: anisotropic Gaussian at each annotated node, peak 1.
+  # sigma is in µm — scalar or [z, y, x] list — converted per-axis with voxel
+  # scale (z 1.625, y/x 0.40625 µm).
+  deep_supervision: 0   # unet25d: N aux heatmap heads on the stride-2..2^N
+                        # decoder stages, train-time only (nnU-Net style;
+                        # aux MSE on max-pooled targets / min-pooled masks,
+                        # weights loss.ds_weights). 0 = off
+  coarse_target: binary # unet25d_coarse cls teacher: binary (BCE centre +
+                        # near-block ignore) | gauss (Gaussian heatmap + MSE
+                        # on the coarse grid, sigma = heatmap_sigma_um;
+                        # det_threshold is then a RAW value, not a probability)
+  heatmap_sigma_um: 2.0
+  # peak extraction (val / test): local maxima via max_pool3d + threshold.
+  # nms_kernel is (z,y,x) voxels; [3,7,7] ~ ±1.6 / ±1.2 / ±1.2 µm.
+  det_threshold: 0.2    # with min_track_len=4 the filter absorbs low-th spurious cost;
+                        # th x L grid on dl_011: 0.2/L4 = 0.8778 vs 0.3/L4 = 0.8722
+  nms_kernel: [3, 7, 7]
+  amp_fp32_modules: []  # dotted submodule paths to run OUTSIDE autocast in fp32
+                        # (fp16 activation-overflow guard, rogii pattern; see
+                        # core/model.py _AmpFp32). dl_094 diagnosis: convnext
+                        # stage2 last-block residual branch + its decoder skip
+                        # consumer blow up 20x at lr 3e-4 before the NaN
+  resume_path: null     # checkpoint to resume from
+  save_last: true
+  ema: false
+  ema_decay: 0.999
+  ema_update_after_step: 0
+
+data:
+  div_oversample: 0.0   # probability of drawing a DIVISION-adjacent frame instead
+                        # of a uniform annotated one (pair/siamese datasets).
+                        # GT has 151 divisions over 199 videos, so uniform
+                        # sampling leaves the matcher unable to place a second
+                        # daughter (dl_136 diagnosis). 0 = off.
+  div_window: 1         # frames around the event that count as division-adjacent
+                        # (1 = the boundary itself plus one either side: the
+                        # mother just before and the daughters just after)
+  train_dir: input/train
+  test_dir: input/test
+  det_cache_dir: output/det_cache   # mask_mode=carved
+  champion_det_dir: null            # when set,
+                                    # the siamese embedding loss uses these cached champion
+                                    # detections as anchors/candidates (loss.embed_only)
+  flow_cache_dir: null              # when set,
+                                    # per-node flow sampled from the dense field becomes the
+                                    # matcher's candidate_offset_a in train AND embed-val
+                                    # (dl_333: train/inference-consistent flow drift, no
+                                    # in-loop flow net; grid-decoupled from data.downsample)
+  drop_dup_frames: true             # drop frozen frames (byte-copies of t-1; 6bba ~7.4%,
+                                    # zero info) from training items
+  dup_frames_path: data/dup_frames.json
+  drop_anomaly_links: true          # mask anomalous GT links from TRAIN link supervision
+                                    # (identity switches / spike nodes' edges / f20478e9
+                                    # acq jump). Val link sets stay
+                                    # full so metrics remain comparable across runs
+  anomaly_links_path: data/gt_anomaly_links.csv
+  # CV design is an OPEN question: only 2 embryos, so this
+  # sample-level, embryo-stratified split is for DL model selection only. The main
+  # CV number stays the official metric over all 199 samples
+  # (full out-of-fold evaluation).
+  fold_num: 5
+  fold_id: 0
+  num_workers: 8
+  batch_size: 16
+  downsample: [1, 1, 1]   # (z,y,x) mean-pool factors on the input volume. [1,4,4] ->
+                          # isotropic 1.625 µm grid (64x64x64, pilkwang-style); GT/linking/
+                          # eval/submission coords stay in ORIGINAL voxels (peaks are mapped
+                          # back at block centers). crop_size / jitter_yx / nms_kernel are
+                          # interpreted on the downsampled grid.
+  crop_size: [32, 128, 128]   # (z,y,x) voxels; each dim must be divisible by 32 (encoder_depth 5)
+  # train crop: GT-centered with jitter. The chosen node's z (+ jitter) picks the
+  # z crop BEFORE the aug pipeline; the final YX crop is centered on the node's
+  # TRANSFORMED position (+ jitter) AFTER the pipeline, so rotation/scaling see
+  # the full YX plane and border fill mostly stays outside the final crop
+  # (what remains is dropped from the loss via a transformed validity mask).
+  jitter_yx: 64               # crop-center jitter ±N y/x voxels (z = N//4); the chosen node
+                              # may leave the crop at large N; crop itself stays in-volume.
+                              # sweep {32,64,96,128} @400ep: 0.8591/0.8640/0.8494/0.8585 -> 64
+  gain_aug: 0.5               # train-only brightness gain s ~ logU[1/(1+a), 1+a] on the
+                              # normalized crop (intensity non-stationarity). 0 = off.
+                              # sweep {0,0.25,0.5,1.0}: 0.8640/0.8628/0.8659/0.8598 -> 0.5
+  intensity_aug: 0.0          # intensity group (gamma / bg offset /
+                              # additive+Poisson noise / low-freq illumination field /
+                              # per-slice gain), amplitudes calibrated from train stats;
+                              # value scales all amplitudes (1.0 = calibrated, 0 = off)
+  optics_aug: 0.0             # optics group (anisotropic PSF blur with
+                              # independent z/YX sigmas, or mild unsharp; exclusive).
+                              # value scales amplitudes (1.0 = calibrated, 0 = off)
+  local_contrast: false       # dl_156: feed the detector a 2nd input channel =
+                              # frame - local_background() (dl_155's +-4.9 µm p20
+                              # floor). The DoG subtracts a local background, our
+                              # CNN only ever saw absolute intensity. Drives
+                              # model in_planes (core/model.py), so the two cannot
+                              # desync. 0 = off.
+  pseudo_det_dir: null        # dl_169/dl_173: teacher detections (champion_dets/<name>,
+                              # t%04d int32 zyx + c%04d conf per frame) as PSEUDO-POSITIVE
+                              # heatmap targets. GT is 2.8% of true cells; this
+                              # densifies positive supervision ~30x. Pseudo dets within
+                              # loss.dup_radius_um of a GT node are dropped (GT wins);
+                              # remaining unmatched DoG dets are carved as before. For a
+                              # leak-free fold0 evaluation the teacher must never have
+                              # trained on fold0 (dl_170). null = off.
+  pseudo_pos_th: 0.2          # teacher conf >= this -> pseudo positive
+  pseudo_min_th: 0.05         # [min_th, pos_th) = the teacher's uncertain band, excluded
+                              # from the loss like an unmatched DoG det (dl_172: the
+                              # low-confidence ordering is unreliable — teach it neither
+                              # as background nor as cells). Below min_th: ignored.
+  pseudo_pair_um: 0.0        # dl_177: >0 keeps only strong teacher dets within this
+                             # µm of a GT node as pseudo positives (absorbed-pair
+                             # supervision: the missing second peak next to annotated
+                             # cells); farther strong dets carve. 0 = all strong.
+  distill_target_dir: null   # dl_622: SOFT heatmap distillation. Directory
+                             # of per-sample fp16 uncompressed .npy (T,Z,Y,X) on the model grid,
+                             # written by the teacher ensemble.
+                             # When set, the teacher heatmap REPLACES the GT Gaussian target
+                             # entirely and the loss weight map becomes the aug-validity mask
+                             # alone, so carve / gt_loss_radius_um / ring_weight / pseudo_det_dir
+                             # do not apply on this path. Requires data.downsample == [1,1,1]
+                             # (that is the grid the targets were saved on). null = off.
+  distill_mode: replace
+  random_crop_sampling: false
+  adaptive_sigma_k: 0.0       # dl_175: crowding-adaptive target sharpness. Per GT node,
+                              # in-plane sigma factor = clip(d_nn / (k * max sigma_um),
+                              # 0.5, 1) with d_nn = distance to the nearest other object
+                              # (GT node or DoG det past dup_um). Only crowded cells
+                              # sharpen (the global sigma_xy shrink dl_077/159-162 failed
+                              # because it sharpened everything). sigma_z untouched.
+                              # 0 = off; typical 3.0 (pairs closer than ~6 um sharpen).
+  extra_train_dir: null       # dl_190: directory of DENSELY labelled external samples
+                              # (zarr + geff). Added to the train
+                              # list only (never val / fold split); no det cache needed —
+                              # the carved mask is all ones there (CellStore.dense).
+  extra_p_start: null         # dl_193: curriculum over extra_train_dir — a train item is
+                              # served from the dense pool with probability annealed
+                              # LINEARLY from extra_p_start (epoch 0) to 0 at
+                              # extra_p_end_frac * max_epochs; the tail is real-only. The
+                              # item list stays real-only (epoch = 1 crop per real video).
+                              # null/0 = dl_190 behaviour (dense samples appended as items)
+  extra_p_end_frac: 0.5
+  extra_floor_aug: 0.0        # dl_190: strength of the random smooth background floor
+                              # added to dense external crops (their confocal background
+                              # is ~0, competition frames sit on a 0.16-0.26 glow). 0 = off
+  local_floor_aug: 0.0        # dl_165: train-only floor/signal decontrast aug. Decompose
+                              # the z-cropped frame into local floor (local_background,
+                              # dl_155's ±4.9 µm p20) + signal and rescale the two with
+                              # INDEPENDENT smooth 4x4 gain fields (logU around 1; floor
+                              # amp 1.5*s, signal amp 0.5*s; fires with p=0.5), so
+                              # peak−floor contrast decorrelates from peak intensity.
+                              # Applied BEFORE the aug pipeline on the intact plane (no
+                              # affine zero-fill bias; composes with rot_scale_aug).
+                              # Inference is untouched (1ch). 0 = off.
+  synth_pool_dir: null        # dl_191: pre-generated FULLY-labelled synthetic volume pool
+                              # (calibrated generator). When set,
+                              # a train item is synthetic with probability p_synth annealed
+                              # LINEARLY from synth_p_start (epoch 0) to 0 at
+                              # synth_p_end_frac * max_epochs; the remaining tail trains on
+                              # real data only. Synthetic items get a full supervision mask
+                              # (every cell labelled -> no carve), the dense-teacher
+                              # counterpart to the 2.8%-sparse real GT). null = off.
+  synth_p_start: 1.0          # p_synth at epoch 0
+  synth_p_end_frac: 0.75      # fraction of max_epochs where p_synth reaches 0
+  flip_aug: true              # random y/x flips + random 90° rotation in YX (no z flip:
+                              # z has orientation-consistent optics)
+  rot_scale_aug: false        # 360° random YX rotation + YX scale ~ U[1-s, 1+s] (A.Affine).
+                              # Heatmap sigma stays fixed (rendered from transformed
+                              # keypoints); carve radius scales with the sampled factor.
+  rot_scale_s: 0.3            # the s above
+  rot_scale_rot: true         # false = drop the 360° rotation from the Affine
+                              # (scale-only aug; dl_217 isolates scale after
+                              # rotation measured negative in dl_026)
+  # mini official-metric validation: contiguous full-frame windows, linked and
+  # scored as unadjusted edge Jaccard (val_edge = checkpoint monitor)
+  val_max_samples: 12         # evenly-spaced val samples used per epoch
+  val_window: 40              # consecutive frames per sample (centered on annotated span)
+  val_embed_pairs: 4          # embed_only val: (t, t+1) full-frame pairs per val sample
+                              # (deterministic, evenly spaced; val_emb_acc monitor)
+
+trainer:
+  max_epochs: 400       # 1 epoch = 1 crop/video (~158 items on fold0)
+  devices: 1
+  strategy: "auto"
+  check_val_every_n_epoch: 10
+  sync_batchnorm: false
+  accelerator: "auto"
+  precision: "16-mixed"
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  deterministic: false
+  benchmark: true
+
+test:
+  mode: val             # val -> official edge metric on the val fold; test -> submission
+  output_dir: output
+  submission_name: dl_001
+  max_link_um: 5.5      # Hungarian link gate (µm) on drift-compensated residuals.
+                        # 7.0 until dl_134: that was swept on fold0 in a world with NO
+                        # matcher, where the base gate had to be wide enough to catch long
+                        # links on distance alone. With the confidence gate admitting long
+                        # links on probability (ext 12-14 / p>=0.5), the base gate's only
+                        # job is to REJECT unconfident ones, so it wants to be tighter.
+                        # 5-fold OOF (199 samples), unimodal: 3.5 .8961 / 4 .8968 /
+                        # 4.5 .8972 / 5 .8975 / **5.5 .8979** / 6 .8976 / 6.5 .8965 /
+                        # 7 .8950 / 8 .8875. Per fold +0.0000..+0.0063, never negative —
+                        # and the ZERO is fold0, the fold 7.0 was fitted on.
+  drift_comp: true      # iterative linking: re-match on global-translation-compensated
+                        # distances (collective flow). dl_005 fold0 val:
+                        # 0.8398 -> 0.8561 (+0.016; TP +231, FP -277)
+  drift_iters: 2        # estimate-and-rematch repetitions (1: 0.8561, 2: 0.8579 on dl_005)
+  subvoxel: false       # heatmap-centroid subvoxel peak refinement for linking distances
+                        # (node coords stay integer; jitter rationale)
+  tta: none             # heatmap-average TTA in 21_test: none | flip2 | flip4 | rot4
+                        # (rot4 needs square YX; dl_011+TTA: flip2 +0.004, rot4 +0.005)
+  flow_link: false      # pair model only: per-node flow-DEVIATION compensation in
+                        # linking (collective part stays with drift_comp):
+                        # comp_i = flow_blend * clip(flow_i - median_flow, flow_clip_um)
+  flow_blend: 1.0       # shrinkage λ on the flow deviation
+  flow_clip_um: 2.0     # µm clip on the deviation (guards heavy prediction tails)
+  flow_win: 3           # cube side for window-mean flow sampling at each peak
+  min_track_len: 4      # drop tracks shorter than this after linking (1 = off).
+                        # short tracks are mostly spurious; sweep 1-10 on dl_021@th0.2:
+                        # plateau L=3-5 (0.8702/0.8713/0.8711), decline from L=6
+  amp: false            # fp16 autocast around the ENCODER forwards at inference.
+                        # MEASURED AND REJECTED (2026-08-22, 002 pipeline on fold0
+                        # val): 0.8963 -> 0.8717 for only 1.31x on an A6000
+                        # (12.2 -> 9.3 s/dataset). No NaN (the matcher is kept
+                        # fp32, see below) — the loss is the DETECTION heatmap
+                        # rounding across the 0.2 threshold: TP -459, FP +267.
+                        # Kept as a flag; do not enable without re-measuring.
+                        # The matcher is explicitly excluded (eval_embed_link
+                        # build_matcher_scores): autocast casts per op, so MHA
+                        # would run fp16 internally and QK^T overflows to NaN
+                        # regardless of the .float() on its inputs (core/matcher.py)
+  frames_per_batch: 4   # full frames per forward pass at inference
+
+opt:
+  opt: "AdamW"
+  lr: 1e-3        # effnetv2_s optimum (1e-3 ≈ 3e-4 for it; convnext/caformer prefer 1e-4)
+  weight_decay: 0
+  matcher_lr: null   # siamese: separate lr for the scratch head (matcher.* + embed_*)
+                     # while a pretrained trunk keeps opt.lr (dl_421; null = single lr)
+
+scheduler:
+  sched: "cosine"
+  min_lr: 1e-6
+  warmup_epochs: 3
+
+loss:
+  name: "mse"           # mse | l1
+  # sparse-label mask (see core/dataset.py docstring):
+  #   carved  = supervise everything except ~carve_radius_um around unmatched DoG
+  #             detections (suspected unlabeled cells); needs det_cache
+  #   support = supervise only the ~3σ Gaussian support of annotated nodes
+  mask_mode: "carved"
+  carve_radius_um: 6.0  # exclusion radius around suspected unlabeled cells
+  gt_loss_radius_um: 0.0  # >0: restrict supervision to ellipsoids of this
+                        # radius (µm, per-axis converted) around GT nodes —
+                        # far unlabeled background gets weight 0 instead of
+                        # negative. Carves within the region are preserved
+                        # (dl_233; single-frame CellTrainDataset only)
+  carve_weight: 0.0     # loss weight left INSIDE a carve. 0 = the original hard carve
+                        # (unlabeled cells teach nothing); 1 = no carve (they are ordinary
+                        # background). Intermediate = weak negatives, which teach the
+                        # detector WHICH cells get annotated: the public pilkwang detector
+                        # trains every non-GT voxel as a 0.01-weight negative and reaches
+                        # 0.987 annotated recall at 0.78x n_total, where ours needs 1.10x
+                        # for 0.979
+  core_sigma: 1.5       # inner core (in σ) of annotated nodes kept even inside a carve:
+                        # target there is the cell's own Gaussian (correct regardless of
+                        # neighbors); the 1.5σ-3σ ring yields to carving
+  dup_radius_um: 2.0    # unmatched detections closer than this to an annotated node are
+                        # duplicate detections of that cell -> do not carve
+  pseudo_weight: 0.3    # dl_173: weight of the teacher-side TERM. Two supervision
+                        # sources, one mean each: loss = mean(GT support) +
+                        # pseudo_weight * mean(pseudo support ∪ background) — the
+                        # background zeros come from the teacher's silence, so they sit
+                        # inside the teacher term at the same trust level (bg_weight is
+                        # unused on this path). GT gradient stays undiluted by the ~30x
+                        # pseudo mass. (dl_169/170 used a per-voxel 0.3 inside one
+                        # pooled positive mean + a separate weight-1 bg term instead.)
+  ring_weight: 0.0      # dl_176 candidate: extra loss weight on the target's
+                        # 3sigma..1sigma mid ring (mask *= 1 + w * ring) — where a
+                        # merged two-cell blob parks its excess mass. 0 = off.
+  pseudo_pool_bg: true  # dl_173: background pooled into the teacher term (above).
+                        # false (dl_174): background stays its own bg_weight term —
+                        # loss = gt + pseudo_weight*ps_pos + bg_weight*bg — isolating
+                        # the uncertain-band carve from the bg down-weighting
+  bg_weight: 1.0        # background term weight (pos/bg normalized separately)
+  pooled: false
+  ds_weights: [0.5, 0.25]  # aux-level weights for model.deep_supervision
+                        # (index 0 = stride-2 level); length must match N
+  off_weight: 1.0       # unet25d_coarse: offset-L1 term weight
+  focal_gamma: 0.0      # unet25d_coarse: >0 focal-weights the bg BCE as a
+                        # weighted mean (soft-OHEM on confident FPs); 0 = off
+  # unet25d_coarse v2: near-side 1x2x2 block — the 3 same-z near-side yx
+  # neighbours of each positive get no cls loss but full offset supervision
+  # (|off| <= 1.0 cell); z+-1 and far-side neighbours are plain negatives.
+  # All block cells are mutually Chebyshev-1, so 3^3 NMS keeps exactly one
+  # detection per node (no knob; scheme fixed in core/dataset.py).
+  flow_weight: 0.1      # pair model only: weight of the Gaussian-weighted flow MSE
+  flow_scale_vox: 10.0  # pair model only: flow targets are dz/dy/dx voxel offsets DIVIDED
+                        # by this (network predicts d/scale, O(1) like the heatmaps).
+                        # dl_039/041: raw-voxel targets let the flow term dominate the
+                        # shared decoder/head feature range and wreck the heatmaps
+                        # (chronic over-detection); dl_040 (flow off) trained normally.
+                        # Decode at inference as pred * flow_scale_vox.
+  pos_weight: 0.0       # >0: extra weight = 1 + pos_weight * target on the positive region
+  mixup_p: 1.0          # probability of applying mixup to a batch (only when
+                        # mixup_alpha > 0); remaining batches train plain
+  mixup_alpha: 0.0      # >0: input mixup for detection training (dl_088/dl_179).
+                        # lam ~ Beta(a, a) mixes the INPUTS only; the loss is
+                        # applied separately against both original target/mask
+                        # pairs and combined lam * L1 + (1-lam) * L2 (no linear
+                        # target/mask mixing — carved masks have no meaningful
+                        # blend). temporal=none only; siamese ignores it. 0 = off.
+  # --- siamese embedding loss (model.temporal=siamese) ---
+  embed_weight: 0.1     # scale on the InfoNCE term (multiplied by the warmup ramp).
+                        # 1.0 collapsed detection right at warmup onset (dl_057 ep100-109:
+                        # mini val 0.869 -> 0.625): the CE is O(2-4) vs det MSE O(0.01),
+                        # same gradient-domination mode as the unnormalized flow loss
+                        # (dl_039/041). 0.1 x O(1) matches the proven-harmless flow regime
+  embed_warmup: [0.25, 0.5]   # fraction-of-training schedule: 0 until 25%, linear
+                              # 0 -> 1 over 25-50%, then 1 (joint-from-scratch: early
+                              # detections are garbage, anchors would be empty)
+  embed_radius_um: 12.0 # candidate/negative radius (µm) around each anchor; max
+                        # per-frame displacement + margin (drift-inclusive; the
+                        # 7 µm link gate is intentionally tighter)
+  embed_max_peaks: 384  # train-time cap on candidates per frame per crop
+                        # (random subsample beyond it). 384 truncates the
+                        # densest ~20-28% of items (max observed 865); 1024
+                        # effectively disables the cap (dl_128 base recipe)
+  embed_drop_p: 0.08    # prob. of masking the true positive out of a row and
+                        # teaching null instead (simulated missed detection;
+                        # real successor-miss rate is ~3-4%)
+  r2_sim_weight: 0.0    # >0: second-round simulation (dl_344) — per item, drop
+                        # one claimed true successor per anchor from the
+                        # matcher's b input and supervise the re-run (division
+                        # parent -> surviving sibling, else null), weighted
+                        # into the loss. Matches export_oof_graphs.second_round
+                        # whose ranking feeds the division daughter assignment
+  embed_gt_fill: false  # TRAIN-only positive-pair augmentation: GT nodes that
+                        # take part in a link but got no detection within 7um
+                        # are appended as candidates at their GT coordinate,
+                        # reviving the ~4.6% of links currently skipped for a
+                        # missing endpoint. embed_drop_p applies to them like
+                        # any positive; val stays pure-detection
+  embed_only: false     # dedicated embedding model: skip the detection loss
+                        # entirely (anchors/candidates then come from
+                        # data.champion_det_dir instead of own detections)
+  matcher_cls_weight: 0.0     # >0: per-node other/daughter/parent CE on the
+                              # matcher's final features (needs
+                              # model.matcher_cls_head=true). Teacher pattern
+                              # follows the daughter channel: GT-matched
+                              # detections only, t+2 daughters and rootless
+                              # nodes ignored; per-class separate means
+                              # (DivLoss-style, imbalance ~300 vs ~133k)
+  matcher_cls_other_weight: 1.0  # weight of the "other"-class term in that CE
+  matcher_cls_det_neg: 0.0    # >0: unmatched candidates (unlabeled-cell
+                              # suspects) join the cls loss as weak "other"
+                              # at this relative weight (dl_196 pattern —
+                              # dl_197 measured them floating toward daughter,
+                              # p_dau median 0.142 vs 0.058 matched). Dets
+                              # within 7 um of a positive-class GT node are
+                              # spared (duplicate/split detections)
+
+wandb:
+  project: biohub-dl
+  name: null
+  offline: true   # log locally (wandb/offline-run-*); a hung sync once stalled training.
+                  # upload later on request: uv run wandb sync wandb/offline-run-<...>

@@ -1,0 +1,46 @@
+seed: 42
+data:
+  train_dir: input/train
+  crop_size: [32, 64, 64]
+  downsample: [1, 4, 4]
+  val_fraction: 0.1
+  pairs_per_epoch: 1024
+  num_workers: 4
+  gain_aug: 0.5
+  optics_aug: 1.0
+  d4_aug: true
+model:
+  architecture: 3d
+  base_channels: 16
+  feature_dim: 16
+  max_displacement_vox: [4.0, 6.0, 6.0]
+  correlation_radius: [2, 3, 3]
+  correlation_temperature: 0.07
+train:
+  epochs: 100
+  batch_size: 2
+  lr: 0.0002
+  weight_decay: 0.0001
+  scheduler: none
+  min_lr: 0.000001
+  warmup_epochs: 0
+  precision: amp
+  output_dir: output/ssl_flow_corr
+  resume_path: null
+  checkpoint_every: 1
+loss:
+  photometric: 1.0
+  census: 0.2
+  smoothness: 0.05
+  cycle: 0.1
+  descriptor: 0.1
+  descriptor_margin: 0.2
+  foreground_gain: 10.0
+  occlusion_threshold_vox: 1.5
+  synthetic: 1.0
+  synthetic_max_shift: [2.0, 3.0, 3.0]
+  synthetic_smooth_amplitude: [0.75, 1.5, 1.5]
+eval:
+  batch_size: 1
+  max_pairs: 128
+  match_radius_um: 7.0

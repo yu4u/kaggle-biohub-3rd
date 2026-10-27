@@ -1,0 +1,8 @@
+artifacts/*
+!artifacts/.gitkeep
+cache/*
+!cache/.gitkeep
+.venv/
+__pycache__/
+*.pyc
+/input
