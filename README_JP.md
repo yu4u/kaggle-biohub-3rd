@@ -5,6 +5,8 @@
 Kaggle [Biohub - Cell Tracking During Development](https://www.kaggle.com/competitions/biohub-cell-tracking-during-development) の 3 位解法の実装です。
 解法は [writeup](https://www.kaggle.com/competitions/biohub-cell-tracking-during-development/writeups/3rd-place-solution) で解説しています。手法の解説と ablation 結果は [SOLUTION.md](SOLUTION.md) も参照してください。
 
+論文: [Learning to Track Cells from Sparse Annotations in 3D Time-Lapse Microscopy](https://arxiv.org/abs/2611.06624)。
+
 ![pipeline](misc/pipeline.png)
 
 学習済み重みと再現用の較正器は、[Kaggleデータセット](https://www.kaggle.com/datasets/ren4yu/biohub-sub046-artifacts/)で公開しています。ダウンロード・配置手順は §2.1 を参照してください。
@@ -188,3 +190,19 @@ tests/                  uv run pytest
 ### 名前について
 
 `dl_401`、`div_762`、`flow_164`、`exp_846` などの識別子や、モジュール名に含まれる番号（`div797_*`、`div846_lineage`）は、開発時の内部実験 ID です。ファイル名・設定キー・公開重みとの対応を保つため、そのまま残しています。番号は実験を区別するためのもので、それ以上の意味はありません。`biohub046` は最終提出 046 v4 を指します。
+
+## 7. 引用
+
+本研究やコードが研究の参考になりましたら、以下の論文の引用をご検討ください。
+
+```bibtex
+@misc{uchida2026learningtrackcells,
+  title         = {Learning to Track Cells from Sparse Annotations in {3D} Time-Lapse Microscopy},
+  author        = {Uchida, Yusuke},
+  year          = {2026},
+  eprint        = {2611.06624},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CV},
+  url           = {https://arxiv.org/abs/2611.06624}
+}
+```
